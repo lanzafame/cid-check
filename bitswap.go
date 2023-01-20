@@ -10,7 +10,6 @@ import (
 	bsnet "github.com/ipfs/go-bitswap/network"
 	"github.com/ipfs/go-cid"
 	nrouting "github.com/ipfs/go-ipfs-routing/none"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
 )
@@ -25,20 +24,118 @@ func init() {
 	nilRouter = nr
 }
 
-func checkBitswapCID(ctx context.Context, h host.Host, c cid.Cid, ai peer.AddrInfo) *BsCheckOutput {
+type BS struct {
+	bsnet.BitSwapNetwork
+	rcv *bsReceiver
+}
+
+func (bs BS) checkBitswapCIDs(ctx context.Context, cs []cid.Cid, ai peer.AddrInfo) ([]*BsCheckOutput, int) {
 	target := ai.ID
 
-	bs := bsnet.NewFromIpfsHost(h, nilRouter)
 	msg := bsmsg.New(false)
-	msg.AddEntry(c, 0, bsmsgpb.Message_Wantlist_Have, true)
+	for _, c := range cs {
+		msg.AddEntry(c, 0, bsmsgpb.Message_Wantlist_Have, true)
+	}
+
+	start := time.Now()
+
+	output := []*BsCheckOutput{}
+	if err := bs.SendMessage(ctx, target, msg); err != nil {
+		output = append(output, &BsCheckOutput{
+			Duration:  time.Since(start),
+			Found:     false,
+			Responded: false,
+			Error:     err.Error(),
+		})
+		return output, len(cs)
+	}
+
+	// in case for some reason we're sent a bunch of messages (e.g. wants) from a peer without them responding to our query
+	// FIXME: Why would this be the case?
+	// sctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	// defer cancel()
+	// loop:
+	for {
+		// var res msgOrErr
+		// select {
+		// case res = <-bs.rcv.result:
+		// case <-sctx.Done():
+		// 	break loop
+		// }
+		res := <-bs.rcv.result
+
+		if res.err != nil {
+			output = append(output, &BsCheckOutput{
+				Duration:  time.Since(start),
+				Found:     false,
+				Responded: true,
+				Error:     res.err.Error(),
+			})
+			return output, len(cs)
+		}
+
+		if res.msg == nil {
+			panic("should not be reachable")
+		}
+
+		for _, msgC := range res.msg.Blocks() {
+			for i, c := range cs {
+				if msgC.Cid().Equals(c) {
+					output = append(output, &BsCheckOutput{
+						Cid:       c,
+						Duration:  time.Since(start),
+						Found:     true,
+						Responded: true,
+						Error:     "",
+					})
+					cs = append(cs[:i], cs[i+1:]...)
+				}
+			}
+		}
+
+		for _, msgC := range res.msg.Haves() {
+			for i, c := range cs {
+				if msgC.Equals(c) {
+					output = append(output, &BsCheckOutput{
+						Cid:       c,
+						Duration:  time.Since(start),
+						Found:     true,
+						Responded: true,
+						Error:     "",
+					})
+					cs = append(cs[:i], cs[i+1:]...)
+				}
+			}
+		}
+
+		for _, msgC := range res.msg.DontHaves() {
+			for i, c := range cs {
+				if msgC.Equals(c) {
+					output = append(output, &BsCheckOutput{
+						Cid:       c,
+						Duration:  time.Since(start),
+						Found:     false,
+						Responded: true,
+						Error:     "",
+					})
+					cs = append(cs[:i], cs[i+1:]...)
+				}
+			}
+		}
+		if len(cs) == 0 {
+			return output, 0
+		}
+	}
+	// return output, len(cs)
+}
+
+func (bs BS) checkBitswapCID(ctx context.Context, c cid.Cid, msg bsmsg.BitSwapMessage, ai peer.AddrInfo) *BsCheckOutput {
+	target := ai.ID
 
 	rcv := &bsReceiver{
 		target: target,
 		result: make(chan msgOrErr),
 	}
-
-	bs.Start(rcv)
-	defer bs.Stop()
 
 	start := time.Now()
 
@@ -77,16 +174,16 @@ loop:
 			panic("should not be reachable")
 		}
 
-		for _, msgC := range res.msg.Blocks() {
-			if msgC.Cid().Equals(c) {
-				return &BsCheckOutput{
-					Duration:  time.Since(start),
-					Found:     true,
-					Responded: true,
-					Error:     "",
-				}
-			}
-		}
+		// for _, msgC := range res.msg.Blocks() {
+		// 	if msgC.Cid().Equals(c) {
+		// 		return &BsCheckOutput{
+		// 			Duration:  time.Since(start),
+		// 			Found:     true,
+		// 			Responded: true,
+		// 			Error:     "",
+		// 		}
+		// 	}
+		// }
 
 		for _, msgC := range res.msg.Haves() {
 			if msgC.Equals(c) {

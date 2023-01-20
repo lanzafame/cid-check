@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	bsnet "github.com/ipfs/go-bitswap/network"
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -56,6 +57,7 @@ type Output struct {
 }
 
 type BsCheckOutput struct {
+	Cid       cid.Cid
 	Duration  time.Duration
 	Found     bool
 	Responded bool
@@ -80,6 +82,13 @@ func check(cctx *cli.Context) error {
 		return err
 	}
 	defer progressF.Close()
+
+	debugF, err := os.OpenFile(fmt.Sprintf("cid-check.debug.%d", timestamp), os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	defer debugF.Close()
 
 	offset := cctx.Int("offset") - 1
 	if offset < 0 {
@@ -113,6 +122,9 @@ func check(cctx *cli.Context) error {
 		}
 		cs = append(cs, c)
 	}
+	for _, c := range cs {
+		fmt.Println(c)
+	}
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, time.Second*3)
 	connErr := testHost.Connect(dialCtx, *ai)
@@ -123,19 +135,36 @@ func check(cctx *cli.Context) error {
 		return connErr
 	}
 
+	target := ai.ID
+	rcv := &bsReceiver{
+		target: target,
+		result: make(chan msgOrErr),
+	}
+
+	bs := BS{bsnet.NewFromIpfsHost(testHost, nilRouter), rcv}
+
+	bs.Start(rcv)
+	defer bs.Stop()
+
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(cctx.Int("goroutines"))
 
-	// outputs := []*Output{}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
-			for i := offset; i < len(cs); i++ {
-				c := cs[i]
+			batchsize := 3
+			for i := offset; i < len(cs); i = i + batchsize {
+				var c []cid.Cid
+				if i+batchsize > len(cs) {
+					c = cs[i:]
+				} else {
+					c = cs[i : i+batchsize]
+				}
+				// i += batchsize - 1
 
-				if _, err := progressF.WriteString(fmt.Sprintln(i)); err != nil {
+				if _, err := progressF.WriteString(fmt.Sprintf("%d: %s; len: %d\n", i, c, len(c))); err != nil {
 					fmt.Println("failed to write to progress file")
 					fmt.Println(i)
 				}
@@ -143,26 +172,33 @@ func check(cctx *cli.Context) error {
 				g.Go(func() error {
 					c := c
 
-					bsOut := checkBitswapCID(ctx, testHost, c, *ai)
-					if bsOut.Error != "" {
-						return fmt.Errorf(bsOut.Error)
-					}
-					if !bsOut.Found {
-						if _, err := f.WriteString(fmt.Sprintf("%s\n", c)); err != nil {
-							fmt.Println("failed to write failed cid to file")
-							fmt.Println(cs)
+					bsOuts, remaining := bs.checkBitswapCIDs(ctx, c, *ai)
+					debugF.WriteString(fmt.Sprintf("remaining: %d\n", remaining))
+					for _, bsOut := range bsOuts {
+						debugF.WriteString(fmt.Sprintf("%+v\n", bsOut))
+						if bsOut.Error != "" {
+							return fmt.Errorf(bsOut.Error)
 						}
-						return nil
-					} else {
-						fmt.Printf("%s was found\n", c)
+						if !bsOut.Found {
+							if _, err := f.WriteString(fmt.Sprintf("%s\n", c)); err != nil {
+								fmt.Println("failed to write failed cid to file")
+								fmt.Println(c)
+							}
+							return nil
+						}
 					}
 					return nil
 				})
+				if (i+1)%10 == 0 {
+					percent := float64((i - offset)) / float64(len(cs)-offset-1) * float64(100)
+					fmt.Printf("%d/%d\t%f%%\t%s\n", i-offset, len(cs)-offset-1, percent, cs[i])
+				}
 			}
 
 			if err := g.Wait(); err != nil {
 				return fmt.Errorf("errgroup wait failed: %w", err)
 			}
+
 		}
 	}
 }
