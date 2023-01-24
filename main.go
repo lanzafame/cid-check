@@ -154,7 +154,7 @@ func check(cctx *cli.Context) error {
 		case <-ctx.Done():
 			return nil
 		default:
-			batchsize := 3
+			batchsize := 5
 			for i := offset; i < len(cs); i = i + batchsize {
 				var c []cid.Cid
 				if i+batchsize > len(cs) {
@@ -162,18 +162,22 @@ func check(cctx *cli.Context) error {
 				} else {
 					c = cs[i : i+batchsize]
 				}
-				// i += batchsize - 1
 
 				if _, err := progressF.WriteString(fmt.Sprintf("%d: %s; len: %d\n", i, c, len(c))); err != nil {
 					fmt.Println("failed to write to progress file")
 					fmt.Println(i)
 				}
 
+				if (i+1)%10 == 0 {
+					percent := float64((i - offset)) / float64(len(cs)-offset-1) * float64(100)
+					fmt.Printf("%d/%d\t%f%%\t%s\n", i-offset, len(cs)-offset-1, percent, cs[i])
+				}
+
 				g.Go(func() error {
 					c := c
 
-					bsOuts, remaining := bs.checkBitswapCIDs(ctx, c, *ai)
-					debugF.WriteString(fmt.Sprintf("remaining: %d\n", remaining))
+					bsOuts, _ := bs.checkBitswapCIDs(ctx, c, *ai)
+					// debugF.WriteString(fmt.Sprintf("remaining: %d\n", remaining))
 					for _, bsOut := range bsOuts {
 						debugF.WriteString(fmt.Sprintf("%+v\n", bsOut))
 						if bsOut.Error != "" {
@@ -189,10 +193,6 @@ func check(cctx *cli.Context) error {
 					}
 					return nil
 				})
-				if (i+1)%10 == 0 {
-					percent := float64((i - offset)) / float64(len(cs)-offset-1) * float64(100)
-					fmt.Printf("%d/%d\t%f%%\t%s\n", i-offset, len(cs)-offset-1, percent, cs[i])
-				}
 			}
 
 			if err := g.Wait(); err != nil {
