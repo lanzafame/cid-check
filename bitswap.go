@@ -29,6 +29,21 @@ type BS struct {
 	rcv *bsReceiver
 }
 
+func (bs BS) haveCIDs(ctx context.Context, cs []cid.Cid, ai peer.AddrInfo) msgOrErr {
+	target := ai.ID
+
+	msg := bsmsg.New(false)
+	for _, c := range cs {
+		msg.AddEntry(c, 0, bsmsgpb.Message_Wantlist_Have, true)
+	}
+
+	if err := bs.SendMessage(ctx, target, msg); err != nil {
+		return msgOrErr{msg, err}
+	}
+
+	return <-bs.rcv.result
+}
+
 func (bs BS) checkBitswapCIDs(ctx context.Context, cs []cid.Cid, ai peer.AddrInfo) ([]*BsCheckOutput, int) {
 	target := ai.ID
 
@@ -52,17 +67,17 @@ func (bs BS) checkBitswapCIDs(ctx context.Context, cs []cid.Cid, ai peer.AddrInf
 
 	// in case for some reason we're sent a bunch of messages (e.g. wants) from a peer without them responding to our query
 	// FIXME: Why would this be the case?
-	sctx, cancel := context.WithTimeout(ctx, time.Second*100)
-	defer cancel()
-loop:
+	// 	sctx, cancel := context.WithTimeout(ctx, time.Second*100)
+	// 	defer cancel()
+	// loop:
 	for {
-		var res msgOrErr
-		select {
-		case res = <-bs.rcv.result:
-		case <-sctx.Done():
-			break loop
-		}
-		// res := <-bs.rcv.result
+		// var res msgOrErr
+		// select {
+		// case res = <-bs.rcv.result:
+		// case <-sctx.Done():
+		// 	break loop
+		// }
+		res := <-bs.rcv.result
 
 		if res.err != nil {
 			output = append(output, &BsCheckOutput{

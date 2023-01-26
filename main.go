@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	bsnet "github.com/ipfs/go-bitswap/network"
@@ -64,6 +65,11 @@ type BsCheckOutput struct {
 	Error     string
 }
 
+type FileMux struct {
+	sync.Mutex
+	f *os.File
+}
+
 func check(cctx *cli.Context) error {
 	ctx := context.Background()
 
@@ -75,6 +81,7 @@ func check(cctx *cli.Context) error {
 		return err
 	}
 	defer f.Close()
+	fmux := FileMux{f: f}
 
 	progressF, err := os.OpenFile(fmt.Sprintf("cid-check.progress.%d", timestamp), os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -83,12 +90,13 @@ func check(cctx *cli.Context) error {
 	}
 	defer progressF.Close()
 
-	debugF, err := os.OpenFile(fmt.Sprintf("cid-check.debug.%d", timestamp), os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Println(err)
-		return err
-	}
-	defer debugF.Close()
+	// debugF, err := os.OpenFile(fmt.Sprintf("cid-check.debug.%d", timestamp), os.O_CREATE|os.O_WRONLY, 0644)
+	// if err != nil {
+	// 	log.Println(err)
+	// 	return err
+	// }
+	// defer debugF.Close()
+	// dmux := FileMux{f: debugF}
 
 	offset := cctx.Int("offset") - 1
 	if offset < 0 {
@@ -122,9 +130,9 @@ func check(cctx *cli.Context) error {
 		}
 		cs = append(cs, c)
 	}
-	for _, c := range cs {
-		fmt.Println(c)
-	}
+	// for _, c := range cs {
+	// 	fmt.Println(c)
+	// }
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, time.Second*3)
 	connErr := testHost.Connect(dialCtx, *ai)
@@ -154,7 +162,7 @@ func check(cctx *cli.Context) error {
 		case <-ctx.Done():
 			return nil
 		default:
-			batchsize := 5
+			batchsize := 500
 			for i := offset; i < len(cs); i = i + batchsize {
 				var c []cid.Cid
 				if i+batchsize > len(cs) {
@@ -174,23 +182,29 @@ func check(cctx *cli.Context) error {
 				}
 
 				g.Go(func() error {
+					start := time.Now()
 					c := c
 
-					bsOuts, _ := bs.checkBitswapCIDs(ctx, c, *ai)
-					// debugF.WriteString(fmt.Sprintf("remaining: %d\n", remaining))
-					for _, bsOut := range bsOuts {
-						debugF.WriteString(fmt.Sprintf("%+v\n", bsOut))
-						if bsOut.Error != "" {
-							return fmt.Errorf(bsOut.Error)
-						}
-						if !bsOut.Found {
-							if _, err := f.WriteString(fmt.Sprintf("%s\n", c)); err != nil {
-								fmt.Println("failed to write failed cid to file")
-								fmt.Println(c)
-							}
-							return nil
-						}
+					moe := bs.haveCIDs(ctx, c, *ai)
+					if moe.err != nil {
+						return moe.err
 					}
+
+					if len(moe.msg.DontHaves()) > 0 {
+						// debugF.WriteString(fmt.Sprintf("donthaves: %d\n", len(moe.msg.DontHaves())))
+						fmux.Lock()
+						for _, msg := range moe.msg.DontHaves() {
+							fmux.f.WriteString(fmt.Sprintf("%+v\n", msg))
+						}
+						fmux.Unlock()
+					}
+
+					fmt.Fprintf(
+						os.Stdout,
+						"haves: %d\tdonthaves: %d\tdur: %+v\n",
+						len(moe.msg.Haves()), len(moe.msg.DontHaves()), time.Since(start),
+					)
+
 					return nil
 				})
 			}
