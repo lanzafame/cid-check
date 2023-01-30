@@ -44,6 +44,11 @@ func main() {
 				Usage:   "specify which line to start on in input file; note: 1-indexed",
 				Value:   1,
 			},
+			&cli.BoolFlag{
+				Name:    "dagexport",
+				Aliases: []string{"d"},
+				Value:   false,
+			},
 		},
 		Action: check,
 	}
@@ -141,20 +146,22 @@ func check(cctx *cli.Context) error {
 			select {
 			case m := <-results:
 				processMsg(m, f)
-				if len(m.msg.DontHaves()) > 0 {
-					for _, msg := range m.msg.DontHaves() {
-						d.Go(func() error {
-							msg := msg
-							err := dagExport(msg.String())
-							if err != nil {
-								fmt.Fprintf(os.Stderr, "err: %s", err.Error())
-							}
-							return nil
-						})
+				if cctx.Bool("dagexport") {
+					if len(m.msg.DontHaves()) > 0 {
+						for _, msg := range m.msg.DontHaves() {
+							d.Go(func() error {
+								msg := msg
+								err := dagExport(msg.String())
+								if err != nil {
+									fmt.Fprintf(os.Stderr, "err: %s", err.Error())
+								}
+								return nil
+							})
+						}
 					}
-				}
-				if err := d.Wait(); err != nil {
-					return fmt.Errorf("errgroup wait failed: %w", err)
+					if err := d.Wait(); err != nil {
+						return fmt.Errorf("errgroup wait failed: %w", err)
+					}
 				}
 
 			case <-pctx.Done():
