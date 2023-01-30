@@ -131,22 +131,30 @@ func check(cctx *cli.Context) error {
 
 	target := ai.ID
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, _ := errgroup.WithContext(ctx)
 	g.SetLimit(cctx.Int("goroutines"))
 
 	results := make(chan msgOrErr)
 
+	p, _ := errgroup.WithContext(ctx)
+	p.SetLimit(10)
+
 	d, _ := errgroup.WithContext(ctx)
 	d.SetLimit(100)
 
-	p, pctx := errgroup.WithContext(ctx)
-	p.SetLimit(cctx.Int("goroutines"))
-	p.Go(func() error {
+	dagexport := cctx.Bool("dagexport")
+	go func() error {
 		for {
 			select {
 			case m := <-results:
-				processMsg(m, f)
-				if cctx.Bool("dagexport") {
+				p.Go(func() error {
+					err := processMsg(m, f)
+					if err != nil {
+						return err
+					}
+					return nil
+				})
+				if dagexport {
 					if len(m.msg.DontHaves()) > 0 {
 						for _, msg := range m.msg.DontHaves() {
 							d.Go(func() error {
@@ -163,50 +171,47 @@ func check(cctx *cli.Context) error {
 						return fmt.Errorf("errgroup wait failed: %w", err)
 					}
 				}
-
-			case <-pctx.Done():
+			case <-ctx.Done():
 				return nil
 			}
 		}
-	})
+	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			close(results)
-			return nil
-		default:
-			batchsize := 500
-			for i := offset; i < len(cs); i = i + batchsize {
-				var c []cid.Cid
-				if i+batchsize > len(cs) {
-					c = cs[i:]
-				} else {
-					c = cs[i : i+batchsize]
-				}
-
-				g.Go(func() error {
-					c := c
-
-					ctx, cancel := context.WithTimeout(ctx, time.Second*5)
-					defer cancel()
-					err := haveCIDs(ctx, testHost, target, c, results)
-					if err != nil {
-						return err
-					}
-					return nil
-				})
-			}
-
-			if err := g.Wait(); err != nil {
-				return fmt.Errorf("errgroup wait failed: %w", err)
-			}
-
+	batchsize := 500
+	for i := offset; i < len(cs); i = i + batchsize {
+		var c []cid.Cid
+		if i+batchsize > len(cs) {
+			c = cs[i:]
+		} else {
+			c = cs[i : i+batchsize]
 		}
+
+		g.Go(func() error {
+			c := c
+
+			ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+			defer cancel()
+			err := haveCIDs(ctx, testHost, ai, target, c, results)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
 	}
+
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("errgroup wait failed: %w", err)
+	}
+	fmt.Println("waiting for p group to return...")
+	if err := p.Wait(); err != nil {
+		return fmt.Errorf("errgroup wait failed: %w", err)
+	}
+
+	return nil
 }
 
 func processMsg(moe msgOrErr, f *os.File) error {
+	dur := time.Since(moe.start)
 	if moe.err != nil {
 		fmt.Fprintf(os.Stderr, "processing error: %s\n", moe.err.Error())
 		return nil
@@ -222,7 +227,7 @@ func processMsg(moe msgOrErr, f *os.File) error {
 	fmt.Fprintf(
 		os.Stdout,
 		"haves: %d\tdonthaves: %d\tdur: %v\n",
-		len(moe.msg.Haves()), len(moe.msg.DontHaves()), time.Since(moe.start),
+		len(moe.msg.Haves()), len(moe.msg.DontHaves()), dur,
 	)
 	return nil
 }
