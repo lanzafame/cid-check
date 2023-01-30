@@ -131,8 +131,8 @@ func check(cctx *cli.Context) error {
 
 	results := make(chan msgOrErr)
 
-	// d, _ := errgroup.WithContext(ctx)
-	// d.SetLimit(100)
+	d, _ := errgroup.WithContext(ctx)
+	d.SetLimit(100)
 
 	p, pctx := errgroup.WithContext(ctx)
 	p.SetLimit(cctx.Int("goroutines"))
@@ -143,15 +143,20 @@ func check(cctx *cli.Context) error {
 				processMsg(m, f)
 				if len(m.msg.DontHaves()) > 0 {
 					for _, msg := range m.msg.DontHaves() {
-						// d.Go(func() error {
-						// 	msg := msg
-						err := dagExport(msg.String())
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "err: %s", err.Error())
-						}
-						// })
+						d.Go(func() error {
+							msg := msg
+							err := dagExport(msg.String())
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "err: %s", err.Error())
+							}
+							return nil
+						})
 					}
 				}
+				if err := d.Wait(); err != nil {
+					return fmt.Errorf("errgroup wait failed: %w", err)
+				}
+
 			case <-pctx.Done():
 				return nil
 			}
