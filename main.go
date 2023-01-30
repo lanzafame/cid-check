@@ -49,14 +49,15 @@ func main() {
 				Aliases: []string{"d"},
 				Value:   false,
 			},
+			&cli.IntFlag{
+				Name:    "pprof-port",
+				Aliases: []string{"pp"},
+				Value:   6060,
+			},
 		},
 		Action: check,
 	}
 
-	// server to access pprof stats
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
 	}
@@ -77,6 +78,10 @@ type BsCheckOutput struct {
 }
 
 func check(cctx *cli.Context) error {
+	// server to access pprof stats
+	go func() {
+		log.Println(http.ListenAndServe(fmt.Sprintf("localhost:%d", cctx.Int("pprof-port")), nil))
+	}()
 	ctx := context.Background()
 
 	timestamp := time.Now().Unix()
@@ -140,7 +145,7 @@ func check(cctx *cli.Context) error {
 	p.SetLimit(10)
 
 	d, _ := errgroup.WithContext(ctx)
-	d.SetLimit(500)
+	d.SetLimit(51)
 
 	dagexport := cctx.Bool("dagexport")
 	go func() error {
@@ -152,25 +157,30 @@ func check(cctx *cli.Context) error {
 					if err != nil {
 						return err
 					}
+					if dagexport {
+						d.Go(func() error {
+							if len(m.msg.DontHaves()) > 0 {
+								for _, msg := range m.msg.DontHaves() {
+									d.Go(func() error {
+										msg := msg
+										err := dagExport(msg.String())
+										if err != nil {
+											fmt.Fprintf(os.Stderr, "err: %s", err.Error())
+										}
+										return nil
+									})
+								}
+							}
+							return nil
+						})
+
+						if err := d.Wait(); err != nil {
+							return fmt.Errorf("errgroup wait failed: %w", err)
+						}
+
+					}
 					return nil
 				})
-				if dagexport {
-					d.Go(func() error {
-						if len(m.msg.DontHaves()) > 0 {
-							for _, msg := range m.msg.DontHaves() {
-								d.Go(func() error {
-									msg := msg
-									err := dagExport(msg.String())
-									if err != nil {
-										fmt.Fprintf(os.Stderr, "err: %s", err.Error())
-									}
-									return nil
-								})
-							}
-						}
-						return nil
-					})
-				}
 			case <-ctx.Done():
 				return nil
 			}
@@ -206,10 +216,6 @@ func check(cctx *cli.Context) error {
 	if err := p.Wait(); err != nil {
 		return fmt.Errorf("errgroup wait failed: %w", err)
 	}
-	if err := d.Wait(); err != nil {
-		return fmt.Errorf("errgroup wait failed: %w", err)
-	}
-
 	return nil
 }
 
