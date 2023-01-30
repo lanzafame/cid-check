@@ -140,7 +140,7 @@ func check(cctx *cli.Context) error {
 	p.SetLimit(10)
 
 	d, _ := errgroup.WithContext(ctx)
-	d.SetLimit(100)
+	d.SetLimit(500)
 
 	dagexport := cctx.Bool("dagexport")
 	go func() error {
@@ -155,21 +155,21 @@ func check(cctx *cli.Context) error {
 					return nil
 				})
 				if dagexport {
-					if len(m.msg.DontHaves()) > 0 {
-						for _, msg := range m.msg.DontHaves() {
-							d.Go(func() error {
-								msg := msg
-								err := dagExport(msg.String())
-								if err != nil {
-									fmt.Fprintf(os.Stderr, "err: %s", err.Error())
-								}
-								return nil
-							})
+					d.Go(func() error {
+						if len(m.msg.DontHaves()) > 0 {
+							for _, msg := range m.msg.DontHaves() {
+								d.Go(func() error {
+									msg := msg
+									err := dagExport(msg.String())
+									if err != nil {
+										fmt.Fprintf(os.Stderr, "err: %s", err.Error())
+									}
+									return nil
+								})
+							}
 						}
-					}
-					if err := d.Wait(); err != nil {
-						return fmt.Errorf("errgroup wait failed: %w", err)
-					}
+						return nil
+					})
 				}
 			case <-ctx.Done():
 				return nil
@@ -204,6 +204,9 @@ func check(cctx *cli.Context) error {
 	}
 	fmt.Println("waiting for p group to return...")
 	if err := p.Wait(); err != nil {
+		return fmt.Errorf("errgroup wait failed: %w", err)
+	}
+	if err := d.Wait(); err != nil {
 		return fmt.Errorf("errgroup wait failed: %w", err)
 	}
 
