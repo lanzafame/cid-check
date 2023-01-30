@@ -1,15 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
-	bsnet "github.com/ipfs/go-bitswap/network"
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -46,6 +48,10 @@ func main() {
 		Action: check,
 	}
 
+	// server to access pprof stats
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
 	}
@@ -65,38 +71,17 @@ type BsCheckOutput struct {
 	Error     string
 }
 
-type FileMux struct {
-	sync.Mutex
-	f *os.File
-}
-
 func check(cctx *cli.Context) error {
 	ctx := context.Background()
 
 	timestamp := time.Now().Unix()
 
-	f, err := os.OpenFile(fmt.Sprintf("cid-check.failed.cids.%d", timestamp), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := outputFile("cid-check.failed.cids", timestamp)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
 	defer f.Close()
-	fmux := FileMux{f: f}
-
-	progressF, err := os.OpenFile(fmt.Sprintf("cid-check.progress.%d", timestamp), os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Println(err)
-		return err
-	}
-	defer progressF.Close()
-
-	// debugF, err := os.OpenFile(fmt.Sprintf("cid-check.debug.%d", timestamp), os.O_CREATE|os.O_WRONLY, 0644)
-	// if err != nil {
-	// 	log.Println(err)
-	// 	return err
-	// }
-	// defer debugF.Close()
-	// dmux := FileMux{f: debugF}
 
 	offset := cctx.Int("offset") - 1
 	if offset < 0 {
@@ -130,36 +115,53 @@ func check(cctx *cli.Context) error {
 		}
 		cs = append(cs, c)
 	}
-	// for _, c := range cs {
-	// 	fmt.Println(c)
-	// }
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, time.Second*3)
 	connErr := testHost.Connect(dialCtx, *ai)
 	dialCancel()
 	if connErr != nil {
 		fmt.Println(connErr.Error())
-		//TODO: retry logic
 		return connErr
 	}
 
 	target := ai.ID
-	rcv := &bsReceiver{
-		target: target,
-		result: make(chan msgOrErr),
-	}
-
-	bs := BS{bsnet.NewFromIpfsHost(testHost, nilRouter), rcv}
-
-	bs.Start(rcv)
-	defer bs.Stop()
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(cctx.Int("goroutines"))
 
+	results := make(chan msgOrErr)
+
+	// d, _ := errgroup.WithContext(ctx)
+	// d.SetLimit(100)
+
+	p, pctx := errgroup.WithContext(ctx)
+	p.SetLimit(cctx.Int("goroutines"))
+	p.Go(func() error {
+		for {
+			select {
+			case m := <-results:
+				processMsg(m, f)
+				if len(m.msg.DontHaves()) > 0 {
+					for _, msg := range m.msg.DontHaves() {
+						// d.Go(func() error {
+						// 	msg := msg
+						err := dagExport(msg.String())
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "err: %s", err.Error())
+						}
+						// })
+					}
+				}
+			case <-pctx.Done():
+				return nil
+			}
+		}
+	})
+
 	for {
 		select {
 		case <-ctx.Done():
+			close(results)
 			return nil
 		default:
 			batchsize := 500
@@ -171,40 +173,15 @@ func check(cctx *cli.Context) error {
 					c = cs[i : i+batchsize]
 				}
 
-				if _, err := progressF.WriteString(fmt.Sprintf("%d: %s; len: %d\n", i, c, len(c))); err != nil {
-					fmt.Println("failed to write to progress file")
-					fmt.Println(i)
-				}
-
-				if (i+1)%10 == 0 {
-					percent := float64((i - offset)) / float64(len(cs)-offset-1) * float64(100)
-					fmt.Printf("%d/%d\t%f%%\t%s\n", i-offset, len(cs)-offset-1, percent, cs[i])
-				}
-
 				g.Go(func() error {
-					start := time.Now()
 					c := c
 
-					moe := bs.haveCIDs(ctx, c, *ai)
-					if moe.err != nil {
-						return moe.err
+					ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+					defer cancel()
+					err := haveCIDs(ctx, testHost, target, c, results)
+					if err != nil {
+						return err
 					}
-
-					if len(moe.msg.DontHaves()) > 0 {
-						// debugF.WriteString(fmt.Sprintf("donthaves: %d\n", len(moe.msg.DontHaves())))
-						fmux.Lock()
-						for _, msg := range moe.msg.DontHaves() {
-							fmux.f.WriteString(fmt.Sprintf("%+v\n", msg))
-						}
-						fmux.Unlock()
-					}
-
-					fmt.Fprintf(
-						os.Stdout,
-						"haves: %d\tdonthaves: %d\tdur: %+v\n",
-						len(moe.msg.Haves()), len(moe.msg.DontHaves()), time.Since(start),
-					)
-
 					return nil
 				})
 			}
@@ -215,6 +192,27 @@ func check(cctx *cli.Context) error {
 
 		}
 	}
+}
+
+func processMsg(moe msgOrErr, f *os.File) error {
+	if moe.err != nil {
+		fmt.Fprintf(os.Stderr, "processing error: %s\n", moe.err.Error())
+		return nil
+	}
+	// fmt.Fprintf(os.Stdout, "moe: %+v\n", moe)
+
+	if len(moe.msg.DontHaves()) > 0 {
+		for _, msg := range moe.msg.DontHaves() {
+			f.WriteString(fmt.Sprintf("%+v\n", msg))
+		}
+	}
+
+	fmt.Fprintf(
+		os.Stdout,
+		"haves: %d\tdonthaves: %d\tdur: %v\n",
+		len(moe.msg.Haves()), len(moe.msg.DontHaves()), time.Since(moe.start),
+	)
+	return nil
 }
 
 func processCIDFile(filename string) ([]string, error) {
@@ -228,4 +226,35 @@ func processCIDFile(filename string) ([]string, error) {
 	cidsstr := strings.Split(str, "\n")
 	cidsstr = cidsstr[:len(cidsstr)-1]
 	return cidsstr, nil
+}
+
+func dagExport(cid string) error {
+	cmd := exec.Command("ipfs", "dag", "export", cid)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Start()
+	if err != nil {
+		return err
+	}
+	err = cmd.Wait()
+	if err != nil {
+		return err
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(fmt.Sprintf("%s/%s.car", wd, cid))
+	if err != nil {
+		return err
+	}
+
+	_, err = f.Write(out.Bytes())
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
